@@ -12,12 +12,12 @@ pn.extension(sizing_mode="stretch_width", notifications=True)
 hv.extension("bokeh")
 
 INSTRUCTIONS = """
-    ## Name Chronicles lets you explore the history of names in the United States.
-    - Enter a name in the "Name Input" box to add it to the plot.
-    - Hover over the name's line to see some stats for a given year.
-    - Click on the name's line to focus on it and see the name's gender distribution.
-    - Unsure? Get a random name based on selected criteria.
-    - Want some background on the names? Ask AI for help!
+    #### Name Chronicles lets you explore the history of names in the United States.
+    - Enter a name to add to plot.
+    - See stats by hovering a line.
+    - Click on a line to see the gender distribution.
+    - Get a random name based on selected criteria.
+    - Ask AI for some background info on a name.
     - Have ideas? [Open an issue](https://github.com/ahuang11/name-chronicles/issues).
 """
 
@@ -82,13 +82,14 @@ class StreamHandler(BaseCallbackHandler):
 
 
 class NameChronicles:
-    def __init__(self, refresh=False):
+    def __init__(self):
         super().__init__()
         self.db_path = Path("data/names.db")
-        self._initialize_database(refresh=refresh)
 
         # Main
-        self.holoviews_pane = pn.pane.HoloViews(sizing_mode="stretch_both")
+        self.holoviews_pane = pn.pane.HoloViews(
+            min_height=675, sizing_mode="stretch_both"
+        )
         self.selection = hv.streams.Selection1D()
 
         # Sidebar
@@ -103,7 +104,6 @@ class NameChronicles:
             solid=False,
         )
         self.names_choice.param.watch(self._update_plot, "value")
-        self.names_choice.value = ["Andrew"]
 
         # Reset Widgets
         self.clear_button = pn.widgets.Button(
@@ -177,9 +177,11 @@ class NameChronicles:
             title="Ask AI",
         )
 
+        pn.state.onload(self._initialize_database)
+
     # Database Methods
-    
-    def _initialize_database(self, refresh):
+
+    def _initialize_database(self):
         """
         Initialize database with data from the Social Security Administration.
         """
@@ -204,6 +206,12 @@ class NameChronicles:
         )
         self.conn.execute("DROP TABLE IF EXISTS names")
         self.conn.execute("CREATE TABLE names AS SELECT * FROM df_processed")
+
+        if self.names_choice.value == []:
+            self.names_choice.value = ["Andrew"]
+        else:
+            self.names_choice.param.trigger("value")
+        self.main.objects = [self.holoviews_pane]
 
     def _query_names(self, names):
         """
@@ -456,9 +464,12 @@ class NameChronicles:
             self.ai_pane,
             data_url,
         )
+        self.main = pn.Column(
+            pn.widgets.StaticText(value="Loading, this may take a few seconds...", sizing_mode="stretch_both"),
+        )
         template = pn.template.FastListTemplate(
             sidebar=[sidebar],
-            main=[self.holoviews_pane],
+            main=[self.main],
             title="Name Chronicles",
             theme="dark",
         )
