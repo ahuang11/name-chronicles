@@ -11,6 +11,15 @@ from langchain.chat_models import ChatOpenAI
 pn.extension(sizing_mode="stretch_width", notifications=True)
 hv.extension("bokeh")
 
+INSTRUCTIONS = """
+    ## Name Chronicles lets you explore the history of names in the United States.
+    - Enter a name in the "Name Input" box to add it to the plot.
+    - Hover over the name's line to see some stats for a given year.
+    - Click on the name's line to focus on it and see the name's gender distribution.
+    - Unsure? Get a random name based on selected criteria.
+    - Want some background on the names? Ask AI for help!
+    - Have ideas? [Open an issue](https://github.com/ahuang11/name-chronicles/issues).
+"""
 
 RANDOM_NAME_QUERY = """
     SELECT name, count, 
@@ -169,20 +178,12 @@ class NameChronicles:
         )
 
     # Database Methods
-
-    def _connect_database(self):
-        """
-        Connect to the database.
-        """
-        return duckdb.connect(database=str(self.db_path))
-
+    
     def _initialize_database(self, refresh):
         """
         Initialize database with data from the Social Security Administration.
         """
-        if not refresh and self.db_path.exists():
-            return
-
+        self.conn = duckdb.connect(":memory:")
         df = pd.concat(
             [
                 pd.read_csv(
@@ -201,9 +202,8 @@ class NameChronicles:
             .rename(columns={"F": "female", "M": "male"})
             .fillna(0)
         )
-        with self._connect_database() as conn:
-            conn.execute("DROP TABLE IF EXISTS names")
-            conn.execute("CREATE TABLE names AS SELECT * FROM df_processed")
+        self.conn.execute("DROP TABLE IF EXISTS names")
+        self.conn.execute("CREATE TABLE names AS SELECT * FROM df_processed")
 
     def _query_names(self, names):
         """
@@ -216,19 +216,18 @@ class NameChronicles:
                 top_names_query = TOP_NAMES_WILDCARD_QUERY
             else:
                 top_names_query = TOP_NAMES_SELECT_QUERY
-            with self._connect_database() as conn:
-                top_names = (
-                    conn.execute(top_names_query, [name.lower()])
-                    .fetch_df()["name"]
-                    .tolist()
-                )
-                if len(top_names) == 0:
-                    pn.state.notifications.info(f"No names found matching {name!r}")
-                    continue
-                data_query = DATA_QUERY.format(
-                    placeholders=", ".join(["?"] * len(top_names))
-                )
-                df = conn.execute(data_query, top_names).fetch_df()
+            top_names = (
+                self.conn.execute(top_names_query, [name.lower()])
+                .fetch_df()["name"]
+                .tolist()
+            )
+            if len(top_names) == 0:
+                pn.state.notifications.info(f"No names found matching {name!r}")
+                continue
+            data_query = DATA_QUERY.format(
+                placeholders=", ".join(["?"] * len(top_names))
+            )
+            df = self.conn.execute(data_query, top_names).fetch_df()
             dfs.append(df)
 
         if len(dfs) > 0:
@@ -241,21 +240,20 @@ class NameChronicles:
     # Widget Methods
 
     def _randomize_name(self, event):
-        with self._connect_database() as conn:
-            name_pattern = self.name_pattern.value.lower()
-            if not name_pattern:
-                name_pattern = "%"
-            else:
-                name_pattern = name_pattern.replace("*", "%")
-            count_range = self.count_range.value
-            gender_select = self.gender_select.value.lower()
-            random_names = (
-                conn.execute(
-                    RANDOM_NAME_QUERY, [name_pattern, *count_range, gender_select]
-                )
-                .fetch_df()["name"]
-                .tolist()
+        name_pattern = self.name_pattern.value.lower()
+        if not name_pattern:
+            name_pattern = "%"
+        else:
+            name_pattern = name_pattern.replace("*", "%")
+        count_range = self.count_range.value
+        gender_select = self.gender_select.value.lower()
+        random_names = (
+            self.conn.execute(
+                RANDOM_NAME_QUERY, [name_pattern, *count_range, gender_select]
             )
+            .fetch_df()["name"]
+            .tolist()
+        )
         if random_names:
             for i in range(len(random_names)):
                 random_name = random_names[i]
@@ -449,6 +447,7 @@ class NameChronicles:
             align="end",
         )
         sidebar = pn.Column(
+            INSTRUCTIONS,
             self.names_input,
             self.names_choice,
             reset_row,
