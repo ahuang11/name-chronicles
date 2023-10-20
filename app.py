@@ -5,19 +5,25 @@ import holoviews as hv
 import pandas as pd
 import panel as pn
 from bokeh.models import HoverTool
+from bokeh.models import NumeralTickFormatter
+from pydantic import BaseModel, Field
 from langchain.callbacks.base import BaseCallbackHandler
 from langchain.chat_models import ChatOpenAI
+from langchain.llms.openai import OpenAI
+from langchain.output_parsers import PydanticOutputParser
+from langchain.pydantic_v1 import BaseModel, Field, validator
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationChain
+from langchain.prompts import PromptTemplate
 
 pn.extension(sizing_mode="stretch_width", notifications=True)
 hv.extension("bokeh")
 
 INSTRUCTIONS = """
     #### Name Chronicles lets you explore the history of names in the United States.
-    - Enter a name to add to plot.
-    - See stats by hovering a line.
-    - Click on a line to see the gender distribution.
-    - Get a random name based on selected criteria.
-    - Ask AI for some background info on a name.
+    - Enter a name to add to plot!
+    - Hover over a line for stats or click for the gender distribution.
+    - Chat with AI for inspiration or get a random name based on input criteria.
     - Have ideas? [Open an issue](https://github.com/ahuang11/name-chronicles/issues).
 """
 
@@ -69,6 +75,11 @@ DATA_QUERY = """
     ORDER BY name, year
 """
 
+MAX_LLM_COUNT = 2000
+
+class FirstNames(BaseModel):
+    names: list[str] = Field(description="List of first names")
+
 
 class StreamHandler(BaseCallbackHandler):
     def __init__(self, container, initial_text="", target_attr="value"):
@@ -84,6 +95,7 @@ class StreamHandler(BaseCallbackHandler):
 class NameChronicles:
     def __init__(self):
         super().__init__()
+        self.llm_use_counter = 0
         self.db_path = Path("data/names.db")
 
         # Main
@@ -149,34 +161,27 @@ class NameChronicles:
         )
 
         # AI Widgets
-        self.ai_key = pn.widgets.PasswordInput(
-            name="OpenAI Key",
-            placeholder="",
+        self.chat_interface = pn.chat.ChatInterface(
+            show_button_name=False,
+            callback=self._prompt_ai,
+            height=500,
+            styles={"background": "white"},
+            disabled=True,
         )
-        self.ai_prompt = pn.widgets.TextInput(
-            name="AI Prompt",
-            value="Share a little history about the name:",
+        self.chat_interface.send(
+            value=(
+                "Ask me about name suggestions or their history! "
+                "To add suggested names, click the button below!"
+            ),
+            user="System",
+            respond=False,
         )
-        ai_button = pn.widgets.Button(
-            name="Get Response",
+        self.parse_ai_button = pn.widgets.Button(
+            name="Parse and Add Names",
             button_style="outline",
             button_type="primary",
+            disabled=False,
         )
-        ai_button.on_click(self._prompt_ai)
-        self.ai_response = pn.widgets.TextAreaInput(
-            placeholder="",
-            disabled=True,
-            height=350,
-        )
-        self.ai_pane = pn.Card(
-            self.ai_key,
-            self.ai_prompt,
-            ai_button,
-            self.ai_response,
-            collapsed=True,
-            title="Ask AI",
-        )
-
         pn.state.onload(self._initialize_database)
 
     # Database Methods
@@ -212,6 +217,29 @@ class NameChronicles:
         else:
             self.names_choice.param.trigger("value")
         self.main.objects = [self.holoviews_pane]
+
+        # Start AI
+        self.callback_handler = pn.chat.langchain.PanelCallbackHandler(
+            self.chat_interface
+        )
+        self.chat_openai = ChatOpenAI(
+            max_tokens=75,
+            streaming=True,
+            callbacks=[self.callback_handler],
+        )
+        self.openai = OpenAI(max_tokens=75)
+        memory = ConversationBufferMemory()
+        self.conversation_chain = ConversationChain(
+            llm=self.chat_openai, memory=memory, callbacks=[self.callback_handler]
+        )
+        self.chat_interface.disabled = False
+        self.parse_ai_button.on_click(self._parse_ai_output)
+        self.pydantic_parser = PydanticOutputParser(pydantic_object=FirstNames)
+        self.prompt_template = PromptTemplate(
+            template="{format_instructions}\n{input}\n",
+            input_variables=["input"],
+            partial_variables={"format_instructions": self.pydantic_parser.get_format_instructions()},
+        )
 
     def _query_names(self, names):
         """
@@ -276,6 +304,21 @@ class NameChronicles:
         else:
             pn.state.notifications.info("No names found matching the criteria!")
 
+    def _add_only_unique_names(self, names):
+        value = self.names_choice.value.copy()
+        options = self.names_choice.options.copy()
+        for name in names:
+            if " " in name:
+                name = name.split(" ", 1)[0]
+            if name not in options:
+                options.append(name)
+            if name not in value:
+                value.append(name)
+        self.names_choice.param.update(
+            options=options,
+            value=value,
+        )
+
     def _add_name(self, event):
         name = event.new.strip().title()
         self.names_input.value = ""
@@ -289,45 +332,48 @@ class NameChronicles:
                 "Maximum of 10 names allowed; please remove some first!"
             )
             return
-        value = self.names_choice.value.copy()
-        options = self.names_choice.options.copy()
-        if name not in options:
-            options.append(name)
-        if name not in value:
-            value.append(name)
-        self.names_choice.param.update(
-            options=options,
-            value=value,
-        )
+        self._add_only_unique_names([name])
 
-    def _prompt_ai(self, event):
-        if not self.ai_key.value:
-            pn.state.notifications.info("Please enter an API key!")
+    async def _prompt_ai(self, contents, user, instance):
+        if self.llm_use_counter >= MAX_LLM_COUNT:
+            pn.state.notifications.info(
+                "Sorry, all the available AI credits have been used!"
+            )
             return
 
-        if not self.ai_prompt.value:
-            pn.state.notifications.info("Please enter a prompt!")
+        prompt = (
+            f"One sentence reply to {contents!r} or concisely suggest other relevant names; "
+            f"if no name is provided use {self.names_choice.value[-1]!r}."
+        )
+        self.last_ai_output = await self.conversation_chain.apredict(
+            input=prompt,
+            callbacks=[self.callback_handler],
+        )
+        self.llm_use_counter += 1
+    
+    async def _parse_ai_output(self, _):
+        if self.llm_use_counter >= MAX_LLM_COUNT:
+            pn.state.notifications.info(
+                "Sorry, all the available AI credits have been used!"
+            )
             return
 
-        stream_handler = StreamHandler(self.ai_response)
-        chat = ChatOpenAI(
-            max_tokens=500,
-            openai_api_key=self.ai_key.value,
-            streaming=True,
-            callbacks=[stream_handler],
-        )
-        self.ai_response.loading = True
+        if self.last_ai_output is None:
+            pn.state.notifications.info("No available AI output to parse!")
+            return
+
         try:
-            if self.selection.index:
-                names = [self._name_indices[self.selection.index[0]]]
-            else:
-                names = self.names_choice.value[:3]
-            chat.predict(f"{self.ai_prompt.value} {names}")
+            names_prompt = self.prompt_template.format_prompt(input=self.last_ai_output).to_string()
+            names_text = await self.openai.apredict(names_prompt)
+            new_names = (await self.pydantic_parser.aparse(names_text)).names
+            print(new_names)
+            self._add_only_unique_names(new_names)
+        except Exception:
+            pn.state.notifications.error("Failed to parse AI output.")
         finally:
-            self.ai_response.loading = False
+            self.last_ai_output = None
 
     # Plot Methods
-
     def _click_plot(self, index):
         gender_nd_overlay = hv.NdOverlay(kdims=["Gender"])
         if not index:
@@ -358,10 +404,6 @@ class NameChronicles:
             kdims=["Gender"],
         ).opts(legend_position="top_left")
 
-    @staticmethod
-    def _format_y(value):
-        return f"{value / 1000}k"
-
     def _update_plot(self, event):
         names = event.new
         print(names)
@@ -374,7 +416,7 @@ class NameChronicles:
             fontscale=1.28,
             xlabel="Year",
             ylabel="Count",
-            yformatter=self._format_y,
+            yformatter=NumeralTickFormatter(format="0.0a"),
             legend_limit=0,
             padding=(0.2, 0.05),
             title="Name Chronicles",
@@ -460,14 +502,19 @@ class NameChronicles:
             self.names_choice,
             reset_row,
             pn.layout.Divider(),
+            self.chat_interface,
+            self.parse_ai_button,
             self.randomize_pane,
-            self.ai_pane,
             data_url,
         )
         self.main = pn.Column(
-            pn.widgets.StaticText(value="Loading, this may take a few seconds...", sizing_mode="stretch_both"),
+            pn.widgets.StaticText(
+                value="Loading, this may take a few seconds...",
+                sizing_mode="stretch_both",
+            ),
         )
         template = pn.template.FastListTemplate(
+            sidebar_width=500,
             sidebar=[sidebar],
             main=[self.main],
             title="Name Chronicles",
