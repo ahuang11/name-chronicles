@@ -31,8 +31,8 @@ RANDOM_NAME_QUERY = """
     SELECT name, count, 
         CASE
             WHEN female_percent >= 0.2 AND female_percent <= 0.8 AND male_percent >= 0.2 AND male_percent <= 0.8 THEN 'unisex'
-            WHEN female_percent > 0.6 THEN 'female'
-            WHEN male_percent > 0.6 THEN 'male'
+            WHEN female_percent > 0.5 THEN 'female'
+            WHEN male_percent > 0.5 THEN 'male'
         END AS gender
     FROM (
         SELECT 
@@ -99,6 +99,9 @@ class NameChronicles:
         self.db_path = Path("data/names.db")
 
         # Main
+        self.scatter_cycle = hv.Cycle("Category10")
+        self.curve_cycle = hv.Cycle("Category10")
+        self.label_cycle = hv.Cycle("Category10")
         self.holoviews_pane = pn.pane.HoloViews(
             min_height=675, sizing_mode="stretch_both"
         )
@@ -135,7 +138,7 @@ class NameChronicles:
         )
         self.count_range = pn.widgets.IntRangeSlider(
             name="Peak Count Range",
-            value=(10000, 50000),
+            value=(0, 100000),
             start=0,
             end=100000,
             step=1000,
@@ -180,8 +183,9 @@ class NameChronicles:
             name="Parse and Add Names",
             button_style="outline",
             button_type="primary",
-            disabled=False,
+            disabled=True,
         )
+        self.last_ai_output = None
         pn.state.onload(self._initialize_database)
 
     # Database Methods
@@ -281,15 +285,18 @@ class NameChronicles:
             name_pattern = "%"
         else:
             name_pattern = name_pattern.replace("*", "%")
+        if not name_pattern.startswith("%"):
+            name_pattern = name_pattern.title()
+
         count_range = self.count_range.value
         gender_select = self.gender_select.value.lower()
         random_names = (
             self.conn.execute(
                 RANDOM_NAME_QUERY, [name_pattern, *count_range, gender_select]
-            )
-            .fetch_df()["name"]
+            ).fetch_df()["name"]
             .tolist()
         )
+        print(len(random_names))
         if random_names:
             for i in range(len(random_names)):
                 random_name = random_names[i]
@@ -345,10 +352,12 @@ class NameChronicles:
             f"One sentence reply to {contents!r} or concisely suggest other relevant names; "
             f"if no name is provided use {self.names_choice.value[-1]!r}."
         )
+        print(prompt)
         self.last_ai_output = await self.conversation_chain.apredict(
             input=prompt,
             callbacks=[self.callback_handler],
         )
+        self.parse_ai_button.disabled = False
         self.llm_use_counter += 1
     
     async def _parse_ai_output(self, _):
@@ -427,9 +436,6 @@ class NameChronicles:
             tooltips=[("Name", "@name"), ("Year", "@year"), ("Count", "@count")],
         )
         self._name_indices = {}
-        scatter_cycle = hv.Cycle("Category10")
-        curve_cycle = hv.Cycle("Category10")
-        label_cycle = hv.Cycle("Category10")
         for i, (name, df_name) in enumerate(self.df.groupby("name")):
             df_name_total = df_name.groupby(
                 ["name", "year", "male", "female"], as_index=False
@@ -453,7 +459,7 @@ class NameChronicles:
             self._scatter_nd_overlay[i] = hv.Scatter(
                 df_name_total, ["year"], ["count", "male", "female", "name"], label=name
             ).opts(
-                color=scatter_cycle,
+                color=self.scatter_cycle,
                 size=4,
                 alpha=0.15,
                 marker="y",
@@ -464,7 +470,7 @@ class NameChronicles:
             self._curve_nd_overlay[i] = hv.Curve(
                 df_name_total, ["year"], ["count"], label=name
             ).opts(
-                color=curve_cycle,
+                color=self.curve_cycle,
                 tools=["tap"],
                 line_width=3,
             )
@@ -473,7 +479,7 @@ class NameChronicles:
             ).opts(
                 text_align="right",
                 text_baseline="bottom",
-                text_color=label_cycle,
+                text_color=self.label_cycle,
             )
             self._name_indices[i] = name
         self.selection.source = self._curve_nd_overlay
